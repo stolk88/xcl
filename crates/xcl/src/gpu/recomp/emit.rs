@@ -4923,8 +4923,10 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(fill, "        o.p{k} = {v};");
     }
     let tri_base = MESH_HEADER + mv as usize * vd;
-    let split = passthrough_split(ms, elems.len());
-    if split == 1 {
+    // DXC charges ALIGN32(count), not the declared count. A record can fit the
+    // raw product and still be rejected (`vertex plus primitive output size`).
+    let elements = elems.len();
+    if mesh_output_fits(elements, mv) {
         let _ = writeln!(
             h,
             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
@@ -4945,7 +4947,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     }
     // over the mesh output limit: `split` mesh groups per record, each a run of its
     // triangles with their own copies of the three vertices
-    let ppg = mp.div_ceil(split);
+    let split = passthrough_split(ms, elements);
+    let ppg = mp.max(1).div_ceil(split).clamp(1, prims_per_group(elements, mp.max(1)));
     let _ = writeln!(
         h,
         "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}])\n{{",
@@ -4970,15 +4973,46 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
 /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
 const MESH_OUTPUT_BYTES: u32 = 32768;
 
-/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
-/// mesh output limit as they are, else the triangles are split into runs whose own vertex
-/// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
+/// DXC's mesh-output check (`DxilValidation.cpp`): each signature scalar is 4 bytes,
+/// and the vertex count is rounded up to a multiple of 32 before multiplying.
+/// The pass-through has no per-primitive attributes, so only the vertex signature counts.
+fn align32(n: u32) -> u32 {
+    n.saturating_add(31) & !31
+}
+
+fn vertex_attr_bytes(elements: usize) -> u32 {
+    16u32.saturating_mul((elements as u32).saturating_add(1))
+}
+
+fn mesh_output_bytes(elements: usize, vertices: u32) -> u32 {
+    vertex_attr_bytes(elements).saturating_mul(align32(vertices.max(1)))
+}
+
+fn mesh_output_fits(elements: usize, vertices: u32) -> bool {
+    vertices > 0 && vertices <= 256 && mesh_output_bytes(elements, vertices) <= MESH_OUTPUT_BYTES
+}
+
+/// Triangles one split group may declare. Three private vertices per triangle, and
+/// that vertex count has to fit both the 256 cap and DXC's aligned output size.
+fn prims_per_group(elements: usize, max_prims: u32) -> u32 {
+    let cap = max_prims.max(1).min(256);
+    let mut best = 1u32;
+    let mut ppg = 1u32;
+    while ppg <= cap && 3u32.saturating_mul(ppg) <= 256 && mesh_output_fits(elements, 3 * ppg) {
+        best = ppg;
+        ppg += 1;
+    }
+    best
+}
+
+/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit
+/// DXC's aligned output limit as they are, else the triangles are split into runs whose
+/// own vertex copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
-    let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
+    if mesh_output_fits(elements, ms.max_vertices) {
         return 1;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
+    let ppg = prims_per_group(elements, ms.max_primitives);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
@@ -5964,3 +5998,45 @@ uint fclass64(double f) {
     return n ? 3u : 8u;
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texcoord(index: u32) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            system_value: 0,
+            component_type: 3,
+            register: index,
+            mask: 0xF,
+            rw_mask: 0xF,
+            stream: 0,
+        }
+    }
+
+    /// 16 float4s + SV_Position is 272 bytes a vertex. 97 vertices are 26384 bytes, under
+    /// 32768, but DXC multiplies by ALIGN32(97) = 128 and rejects 34816. The old split
+    /// returned 1 and DXC failed the pass-through (`vertex plus primitive output size`).
+    #[test]
+    fn mesh_passthrough_splits_when_only_the_aligned_count_overflows() {
+        let ms = MsInterface { outputs: (0..16).map(texcoord).collect(), threads: 32, max_vertices: 97, max_primitives: 97 };
+        assert!(272 * 97 <= MESH_OUTPUT_BYTES);
+        assert!(272 * 128 > MESH_OUTPUT_BYTES);
+        assert_eq!(passthrough_split(&ms, 16), 4);
+        let hlsl = mesh_passthrough(&ms);
+        assert!(hlsl.contains("out vertices XclVert verts[75]"), "{hlsl}");
+        assert!(hlsl.contains("out indices uint3 tris[25]"), "{hlsl}");
+        assert!(!hlsl.contains("verts[97]"), "{hlsl}");
+        assert!(mesh_output_bytes(16, 75) <= MESH_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn mesh_passthrough_keeps_one_group_when_the_aligned_count_fits() {
+        let ms = MsInterface { outputs: vec![texcoord(0)], threads: 32, max_vertices: 64, max_primitives: 64 };
+        assert_eq!(passthrough_split(&ms, 1), 1);
+        let hlsl = mesh_passthrough(&ms);
+        assert!(hlsl.contains("out vertices XclVert verts[64]"), "{hlsl}");
+    }
+}
