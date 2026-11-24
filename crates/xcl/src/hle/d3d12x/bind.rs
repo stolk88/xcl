@@ -7,6 +7,8 @@
 //! layout – instead of going to the PC list, and each Dispatch with a translated pipeline
 //! binds the ABI root signature, writes the user SGPRs (`io`) and the argument table to
 //! unified memory and dispatches. That memory stays until the list's allocator is reset.
+//! Mesh pipelines (`DispatchMesh`): AS compute (if any), MS compute, UAV barrier, then the
+//! pass-through mesh PSO.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -850,6 +852,79 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     Ok(())
 }
 
+unsafe fn uav_barrier(list: &ID3D12GraphicsCommandList) {
+    let b = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+        },
+    };
+    list.ResourceBarrier(&[b]);
+}
+
+/// #79 DispatchMesh (PC): a console MS / AS+MS mesh PSO first runs its compute pass(es), then
+/// the pass-through mesh shader. Returns true when the call was handled (including failure
+/// after logging).
+pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) -> bool {
+    let mesh_pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let Some(tp) = super::real::two_pass_of(mesh_pso) else {
+        return false;
+    };
+    let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else {
+        return true;
+    };
+    let run_cs = |pso: usize| -> Result<(), String> {
+        if pso == 0 {
+            return Ok(());
+        }
+        translated_dispatch(this, list, pso, x, y, z)
+    };
+    if tp.as_compute != 0 {
+        match run_cs(tp.as_compute) {
+            Ok(()) => count(DISPATCHES),
+            Err(e) => {
+                count(DISPATCHES_SKIPPED);
+                log_mesh_skip("AS compute", &e);
+                return true;
+            }
+        }
+    }
+    match run_cs(tp.compute) {
+        Ok(()) => count(DISPATCHES),
+        Err(e) => {
+            count(DISPATCHES_SKIPPED);
+            log_mesh_skip("MS compute", &e);
+            return true;
+        }
+    }
+    uav_barrier(list);
+    let groups = x.saturating_mul(tp.mesh_groups_per_record);
+    match bind_abi(this, list, mesh_pso, true) {
+        Ok(()) => {
+            count(DRAWS);
+            let Ok(list6) = list.cast::<ID3D12GraphicsCommandList6>() else {
+                count(DRAWS_SKIPPED);
+                log_mesh_skip("DispatchMesh", "ID3D12GraphicsCommandList6");
+                return true;
+            };
+            list6.DispatchMesh(groups, 1, 1);
+        }
+        Err(e) => {
+            count(DRAWS_SKIPPED);
+            log_mesh_skip("mesh draw", &e);
+        }
+    }
+    true
+}
+
+fn log_mesh_skip(phase: &str, e: &str) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        crate::xlog_warn!("D3D12.X: DispatchMesh two-pass {phase} skipped: {e}");
+    }
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
@@ -1188,6 +1263,59 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    #[test]
+    fn dispatch_mesh_unhandled_without_two_pass() {
+        let mut orig_vt = [0usize; 8];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        let mut ext_vt = vec![0usize; 9];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        reset(list_ptr, 0x8200_0100, 0x8200_00A0);
+        assert!(!unsafe { dispatch_mesh(list_ptr, 1, 1, 1) });
+        forget(list_ptr);
+    }
+
+    #[test]
+    fn dispatch_mesh_two_pass_skips_without_uma() {
+        let mesh = 0x8200_0001usize;
+        let cs = 0x8200_0002usize;
+        real::register_two_pass_for_test(mesh, cs, 0, 2);
+        let mut orig_vt = [0usize; 8];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        let mut ext_vt = vec![0usize; 9];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        reset(list_ptr, 0x8200_0100, mesh);
+        let before = counts_snapshot();
+        assert!(unsafe { dispatch_mesh(list_ptr, 2, 1, 1) });
+        let after = counts_snapshot();
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED] || after[DRAWS_SKIPPED] > before[DRAWS_SKIPPED]);
+        forget(list_ptr);
+        real::forget_pso_for_test(mesh);
     }
 
     #[test]

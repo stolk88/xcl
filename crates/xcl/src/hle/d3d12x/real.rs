@@ -1715,6 +1715,26 @@ pub(super) fn register_translated_graphics_for_test(pso: usize) {
 }
 
 #[cfg(test)]
+pub(super) fn register_two_pass_for_test(mesh_pso: usize, compute: usize, as_compute: usize, mesh_groups_per_record: u32) {
+    if mesh_pso == 0 {
+        return;
+    }
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        mesh_pso,
+        std::sync::Arc::new(TwoPassPso {
+            compute,
+            compute_rs: 0,
+            as_compute,
+            mesh_rs: 0,
+            record: crate::gpu::recomp::MsInterface::default(),
+            mesh_groups_per_record,
+            as_iface: None,
+            kind: "MS",
+        }),
+    );
+}
+
+#[cfg(test)]
 pub(super) fn forget_pso_for_test(pso: usize) {
     forget_pso(pso);
 }
@@ -2472,6 +2492,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("OMSetRenderTargets", cl_om_set_render_targets as usize),
             ("ClearRenderTargetView", cl_clear_rtv as usize),
             ("ExecuteIndirect", cl_execute_indirect as usize),
+            ("DispatchMesh", cl_dispatch_mesh as usize),
         ]),
         Kind::DmaList => v.extend_from_slice(&[
             ("Release", cl_release as usize),
@@ -5234,6 +5255,16 @@ unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
     f(this, icount, inst, si, bv, sinst);
+}
+
+unsafe extern "system" fn cl_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::list_x::prepare_draw(this);
+    if super::bind::dispatch_mesh(this, x, y, z) {
+        return;
+    }
+    type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DispatchMesh")));
+    f(this, x, y, z);
 }
 
 #[allow(clippy::too_many_arguments)]
