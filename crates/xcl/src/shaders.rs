@@ -365,6 +365,7 @@ impl RecompAgg {
             recomp::Mode::Pixel(_) => ("PS", "ps_6_6"),
             recomp::Mode::Kernel => ("kernel", "cs_6_6"),
             recomp::Mode::Mesh(_) => ("MS", "cs_6_6"),
+            recomp::Mode::Amplification(_) => ("AS", "cs_6_6"),
             recomp::Mode::Geometry(_) => ("GS", "cs_6_6"),
             recomp::Mode::Compute(_) => ("CS", "cs_6_6"),
         };

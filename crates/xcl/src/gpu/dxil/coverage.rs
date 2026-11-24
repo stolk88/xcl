@@ -24,6 +24,7 @@ pub fn stage_name(mode: &Mode) -> &'static str {
         Mode::Vertex(_) => "VS",
         Mode::Pixel(_) => "PS",
         Mode::Mesh(_) => "MS",
+        Mode::Amplification(_) => "AS",
         Mode::Geometry(_) => "GS",
     }
 }
@@ -239,6 +240,7 @@ pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool
         Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
         Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
         Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
+        Mode::Amplification(_) => Err("amplification mode (AS): not supported by the direct translator".into()),
         Mode::Geometry(_) => Err("geometry mode (ES+GS): not supported by the direct translator".into()),
     }));
     let k = match r {
