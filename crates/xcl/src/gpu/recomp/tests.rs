@@ -2818,6 +2818,21 @@ fn gpu_packed_math_dots_movrel() {
 }
 
 #[test]
+fn dxc_amp_passthrough_compiles() {
+    use super::{amp_passthrough, dxc, AsInterface, AS_HEADER};
+    if dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    let as_ = AsInterface { threads: 64, payload_dwords: 4 };
+    let src = amp_passthrough(&as_);
+    let blob = dxc::compile(&src, "main", "as_6_6", &[]).unwrap_or_else(|e| panic!("amp passthrough: {e}"));
+    assert!(blob.len() > 32);
+    assert!(src.contains("DispatchMesh"));
+    assert_eq!(as_.record_dwords(), AS_HEADER + 4);
+}
+
+#[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
     if dxc::location().is_err() {
@@ -5095,7 +5110,7 @@ fn retail_translation_survey() {
                             Mode::Vertex(_) => "vs_6_6",
                             Mode::Pixel(_) => "ps_6_6",
                             // MS (NGG) and GS run as compute shaders feeding a pass-through mesh shader
-                            Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Kernel => "cs_6_6",
+                            Mode::Compute(_) | Mode::Mesh(_) | Mode::Amplification(_) | Mode::Geometry(_) | Mode::Kernel => "cs_6_6",
                         };
                         let p = f.programs.first().ok_or("FSSM without a program")?;
                         let code = &f.data[p.offset..p.offset + p.len];

@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, AS_HEADER, MESH_HEADER};
+use super::AsInterface;
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -498,6 +499,7 @@ impl Em {
         let threads = match &self.opt.mode {
             Mode::Compute(cs) => cs.threads.iter().product::<u32>(),
             Mode::Mesh(ms) => ms.threads,
+            Mode::Amplification(as_) => as_.threads,
             _ => return None,
         };
         let hw_lanes = if self.x64() || !self.opt.wave64 { 32 } else { 64 };
@@ -574,7 +576,7 @@ impl Em {
     /// hardware wave32 halves that exchange masks and lane values (`PRELUDE_X64`,
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
-        self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+        self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Amplification(_) | Mode::Geometry(_))
     }
 
     /// `ballot` of the program's wave (both halves' words in the split form).
@@ -871,7 +873,7 @@ impl Em {
             }
         }
         // s_sendmsg is a no-op except GS_ALLOC_REQ (mesh) and GS emit/cut (geometry)
-        let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Geometry(_));
+        let mesh_msg = name == "s_sendmsg" && matches!(self.opt.mode, Mode::Mesh(_) | Mode::Amplification(_) | Mode::Geometry(_));
         if NOOPS.contains(&name.as_str()) && !mesh_msg {
             *self.ignored.entry(name).or_default() += 1;
             return Flow::Next;
@@ -903,7 +905,7 @@ impl Em {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
                     // wave: nothing to wait for), a group barrier there would wait for the other
                     self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
-                } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
+                } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_) | Mode::Amplification(_)) {
                     if self.safe_barrier {
                         self.line("xcl_s_barrier();");
                     } else if self.compute_or_mesh_hw_waves() == Some(1) {
@@ -941,6 +943,17 @@ impl Em {
                     let m0 = self.sreg(124);
                     self.line(&format!(
                         "if (lane_id == 0u) {{ res.Store(xcl_rec * 4u, {m0} & 0x3FFu); res.Store(xcl_rec * 4u + 4u, ({m0} >> 12) & 0x7FFu); }}"
+                    ));
+                }
+                Flow::Next
+            }
+            "s_sendmsg" if matches!(self.opt.mode, Mode::Amplification(_)) => {
+                // task dispatch: M0 low 16 = mesh thread groups, high bits / s1 seed payload
+                if rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0xF == 9 {
+                    let m0 = self.sreg(124);
+                    let s1 = self.sreg(125);
+                    self.line(&format!(
+                        "if (lane_id == 0u) {{ res.Store(xcl_as * 4u, ({m0}) & 0xFFFFu); res.Store(xcl_as * 4u + 4u, {s1}); res.Store(xcl_as * 4u + 8u, ({m0}) >> 16); res.Store(xcl_as * 4u + 12u, ({m0}) >> 24); }}"
                     ));
                 }
                 Flow::Next
@@ -1973,6 +1986,14 @@ impl Em {
             }
             (Mode::Mesh(_), 20) => st.push(format!("res.Store(xcl_prm * 4u, {});", srcs[0])),
             (Mode::Mesh(_), 9) => {}
+            (Mode::Amplification(_), 12) => {
+                for c in 0..4.min(4) {
+                    if enabled(c) {
+                        st.push(format!("res.Store((xcl_as + {}u) * 4u, {});", AS_HEADER + c, Self::exp_comp(srcs, compr, c)));
+                    }
+                }
+            }
+            (Mode::Amplification(_), 9 | 20) => {}
             _ => return Err("export target"),
         }
         if !st.is_empty() {
@@ -3980,7 +4001,7 @@ impl Em {
             }
             _ => {}
         }
-        if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
+        if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Amplification(_) | Mode::Geometry(_) | Mode::Compute(_)) {
             return Err("LDS outside compute");
         }
         // geometry mode: where each GS lane puts its output vertices (lowest LDS address written)
@@ -4165,6 +4186,7 @@ impl Em {
         match &self.opt.mode {
             Mode::Compute(cs) => cs.threads.iter().product(),
             Mode::Mesh(ms) => ms.threads,
+            Mode::Amplification(as_) => as_.threads,
             _ => 64,
         }
     }
@@ -4490,6 +4512,41 @@ impl Em {
                 }
                 h.push_str("}\n");
             }
+            Mode::Amplification(as_) => {
+                let native_lanes = if !self.opt.wave64 || self.x64() { 32 } else { 64 };
+                let lanes = if self.opt.wave64 { 64 } else { 32 };
+                if self.uses_lds && !self.x64_lds() {
+                    h.push_str("groupshared uint xcl_lds[8192];\n");
+                }
+                self.safe_barrier_prelude(&mut h);
+                let t = as_.threads;
+                let _ = writeln!(h, "[WaveSize({native_lanes})]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID)\n{{");
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_init(gi);\n");
+                }
+                if self.x64() {
+                    self.x64_entry(&mut h);
+                    h.push_str("    gi = xcl_tid;\n");
+                } else {
+                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                }
+                let _ = writeln!(h, "    uint xcl_wave = gi / {lanes}u;\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
+                let _ = writeln!(h, "    uint xcl_as = gid.x * {}u;", as_.record_dwords());
+                load_sgprs(&mut h);
+                if sg.contains(&3) {
+                    h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
+                }
+                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                for &v in &self.vgprs {
+                    let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
+                    let _ = writeln!(h, "    uint v{v} = {init};");
+                }
+                h.push_str(body);
+                if self.safe_barrier {
+                    h.push_str("    xcl_s_barrier_exit();\n");
+                }
+                h.push_str("}\n");
+            }
             Mode::Geometry(g) => {
                 if !self.x64() {
                     let pg = super::GS_PRIMS_PER_GROUP;
@@ -4784,6 +4841,33 @@ pub fn rect_list_gs(outputs: &[SigElement]) -> String {
 /// triangles. Null primitives (bit 31) and out-of-range indices are culled.
 pub fn mesh_passthrough(ms: &MsInterface) -> String {
     mesh_passthrough_for(ms, None)
+}
+
+/// Pass-through amplification shader for a translated task program: reads per-task records
+/// the compute pass wrote into `res` and calls `DispatchMesh` with the stored payload.
+pub fn amp_passthrough(as_: &AsInterface) -> String {
+    let mut h = String::new();
+    h.push_str("// generated by XCL: amplification pass-through for a translated task shader\n");
+    h.push_str("RWByteAddressBuffer res : register(u1);\n");
+    let rec = as_.record_dwords();
+    let t = as_.threads.clamp(1, 128);
+    let pay = as_.payload_dwords.clamp(1, 4);
+    h.push_str("struct XclPayload { uint p0");
+    for k in 1..pay {
+        let _ = write!(h, "; uint p{k}");
+    }
+    h.push_str(" };\n");
+    let _ = writeln!(
+        h,
+        "[numthreads({t}, 1, 1)]\nvoid main(uint gtid : SV_GroupIndex, uint3 gid : SV_GroupID, inout XclPayload payload)\n{{"
+    );
+    let _ = writeln!(h, "    uint base = gid.x * {rec}u;");
+    let _ = writeln!(h, "    uint n = res.Load(base * 4u);");
+    for k in 0..pay as usize {
+        let _ = writeln!(h, "    payload.p{k} = res.Load((base + {AS_HEADER}u + {k}u) * 4u);");
+    }
+    h.push_str("    if (gtid == 0u && n > 0u)\n        DispatchMesh(n, 1, 1, payload);\n}\n");
+    h
 }
 
 /// `mesh_passthrough` whose vertices carry exactly what a pixel shader with `ps_inputs`

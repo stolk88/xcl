@@ -4419,22 +4419,27 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
 /// mesh pipeline state (pass-through MS + PS); the draw first runs `compute` (the console
 /// program, one record per thread group into `res`), then the mesh pipeline over the records.
 pub struct TwoPassPso {
-    /// compute pipeline state, owned here, and its root signature (static samplers)
+    /// mesh (NGG) compute pipeline state, owned here, and its root signature (static samplers)
     pub compute: usize,
     pub compute_rs: usize,
-    /// root signature of the mesh pipeline (the title's PSO; its PS's static samplers)
-    pub mesh_rs: usize,
+    /// amplification task compute pass (AS+MS pipelines)
+    pub as_compute: usize,
     pub record: crate::gpu::recomp::MsInterface,
     /// DispatchMesh groups per record (see `pso::TwoPass`)
     pub mesh_groups_per_record: u32,
-    /// "MS" or "GS"
+    /// root signature of the mesh pipeline (the title's PSO; its PS's static samplers)
+    pub mesh_rs: usize,
+    pub as_iface: Option<crate::gpu::recomp::AsInterface>,
+    /// "MS", "GS", or "AS+MS"
     pub kind: &'static str,
 }
 
 impl Drop for TwoPassPso {
     fn drop(&mut self) {
-        // the compute pipeline state is XCL's (the root signatures are cached or the title's)
         super::pso_async::release(self.compute);
+        if self.as_compute != 0 {
+            super::pso_async::release(self.as_compute);
+        }
     }
 }
 
@@ -4529,6 +4534,8 @@ fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let split_ms = wave32_only(this);
+    let wave_note = if split_ms { "wave32-split" } else { "wave64" };
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
@@ -4538,10 +4545,26 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let iid = pc_iid(Kind::PipelineState);
+    let mut as_compute = 0usize;
+    if let Some(as_cs) = &tp.as_cs {
+        let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        cdesc.CS = bytecode(as_cs);
+        let mut compute: *mut c_void = std::ptr::null_mut();
+        let hc = driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
+        if hc < 0 || compute.is_null() {
+            note_translation_error(format!("the driver rejected the AS compute pass ({hc:#x})"));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
+            release(*ppv);
+            *ppv = std::ptr::null_mut();
+            return E_INVALIDARG;
+        }
+        as_compute = compute as usize;
+    }
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
-    let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
     let hc = driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
     if hc < 0 || compute.is_null() {
@@ -4552,10 +4575,30 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         return E_INVALIDARG;
     }
     note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    let ms_path = if tp.as_dxil.is_some() { "AS+MS pass-through" } else { "MS pass-through" };
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+        *ppv as usize,
+        std::sync::Arc::new(TwoPassPso {
+            compute: compute as usize,
+            compute_rs: rs as usize,
+            as_compute,
+            mesh_rs: mesh_rs as usize,
+            record: tp.record,
+            mesh_groups_per_record: tp.mesh_groups_per_record,
+            as_iface: tp.as_iface,
+            kind,
+        }),
+    );
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+    if n < 8 || n % 1000 == 0 {
+        let asb = tp.as_dxil.as_ref().map_or(0, |b| b.len());
+        crate::xlog_info!(
+            "D3D12.X: {kind} pipeline ({wave_note}, {ms_path}): AS compute {} B, MS compute {} B, mesh {} B, AS {} B DXIL",
+            tp.as_cs.as_ref().map_or(0, |b| b.len()),
+            tp.cs.len(),
+            tp.ms.len(),
+            asb
+        );
     }
     hr
 }
@@ -4578,28 +4621,97 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
     let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
     let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
-    // A console MS container in the AS slot and no MS subobject (a retail game's minimap
-    // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
-    // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
+    // Console MS bytecode in the AS slot without an MS subobject: treat as mesh-only (minimap).
     if let (None, Some(a)) = (ms_slot, as_slot) {
         if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
+            let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+            let (tp, (ps, ps_samplers)) =
+                match (console_mesh(a, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
+                    (Ok(tp), Ok(ps)) => (tp, ps),
+                    (Err(e), _) => {
+                        note_translation_error(format!("MS (AS slot): {e}"));
+                        return Some(E_INVALIDARG);
+                    }
+                    (_, Err(e)) => {
+                        note_translation_error(e);
+                        return Some(E_INVALIDARG);
+                    }
+                };
+            let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
+            let mut out = StreamOut::default();
+            out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+            if let Some(p) = &ps {
+                out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+            }
+            for (ty, payload) in &subs {
+                let skip = [0, 2, 19, 24, 25].contains(ty);
+                if !skip {
+                    let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+                    if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
+                        let mut p = payload.to_vec();
+                        for k in 0..if *ty == 15 { 8 } else { 1 } {
+                            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                            p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                        }
+                        out.raw(*ty, &p, palign == 8);
+                        continue;
+                    }
+                    out.raw(*ty, payload, palign == 8);
+                }
+            }
+            return Some(finish_two_pass(this, &out, tp, rs, "MS (AS slot)", riid, ppv));
+        }
+    }
+    if let (Some(a), Some(ms_b)) = (as_slot, ms_slot) {
+        let as_is_task = crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "AS");
+        if as_is_task && is_console(a) && is_console(ms_b) && !std::ptr::eq(a.as_ptr(), ms_b.as_ptr()) {
+        let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
+        let (tp, (ps, ps_samplers)) = match (
+            crate::gpu::recomp::pso::console_as_mesh(a, ms_b, ps, wave32_only(this)),
+            two_pass_ps(ps, graphics_wave32(this)),
+        ) {
+            (Ok(tp), Ok(ps)) => (tp, ps),
+            (Err(e), _) => {
+                note_translation_error(format!("AS+MS: {e}"));
+                return Some(E_INVALIDARG);
+            }
+            (_, Err(e)) => {
+                note_translation_error(e);
+                return Some(E_INVALIDARG);
+            }
+        };
+        let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
+        let Some(as_dxil) = &tp.as_dxil else { return Some(E_INVALIDARG) };
+        let mut out = StreamOut::default();
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, as_dxil);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
+        if let Some(p) = &ps {
+            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
+        }
+        for (ty, payload) in &subs {
+            let skip = [0, 2, 19, 24, 25].contains(ty);
+            if !skip {
+                let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+                if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
+                    let mut p = payload.to_vec();
+                    for k in 0..if *ty == 15 { 8 } else { 1 } {
+                        let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                        p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                    }
+                    out.raw(*ty, &p, palign == 8);
+                    continue;
+                }
+                out.raw(*ty, payload, palign == 8);
+            }
+        }
+        return Some(finish_two_pass(this, &out, tp, rs, "AS+MS", riid, ppv));
         }
     }
     let ms = ms_slot?;
     if !is_console(ms) {
         return None;
-    }
-    if let Some(a) = as_slot {
-        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
-        note_translation_error(format!(
-            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
-            crate::gpu::shader::fnv64(a),
-            crate::gpu::shader::fnv64(ms)
-        ));
-        return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
     let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
