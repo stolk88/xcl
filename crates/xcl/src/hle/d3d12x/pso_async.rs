@@ -73,6 +73,8 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL) };
         }
     }
+    let pending = p.clone();
+    let _permit = crate::gpu::recomp::dxc::begin_pipeline_build(preload, &move || pending.demand.lock().unwrap().wanted);
     complete(p, job());
     if preload {
         // (under the lock: `want` does not raise this thread after it)
