@@ -162,6 +162,30 @@ fn enter_build() -> BuildFlight {
     BuildFlight
 }
 
+/// Binds waiting now for a pipeline still being built (`title_held`).
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// A bind is waiting for a pipeline the driver is still building. A console title never waits
+/// there. `kernelx::Sleep` does not count that time against the title's stall check.
+pub fn title_held() -> bool {
+    HELD.load(Ordering::Acquire) != 0
+}
+
+struct Held;
+
+impl Held {
+    fn new() -> Held {
+        HELD.fetch_add(1, Ordering::AcqRel);
+        Held
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HELD.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
 }
@@ -386,6 +410,46 @@ fn preload() -> Option<&'static Preload> {
 mod used_tests {
     use super::*;
 
+    /// While a bind waits for a pipeline still being built, the title is held.
+    #[test]
+    fn a_bind_waiting_for_a_build_holds_the_title() {
+        let standin = 0x7E57_B002usize;
+        let (started, building) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = started.send(());
+            let _ = finish.recv();
+            0x5252
+        }), 0);
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, None));
+        building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
+        let t = std::time::Instant::now();
+        while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(title_held(), "a bind waits for a build, but the title is not held");
+        go.send(()).unwrap();
+        assert_eq!(bind.join().unwrap(), 0x5252);
+        assert!(!title_held());
+        let _ = released(standin);
+    }
+
+    /// The driver compile of a pipeline no worker has started does not run on the bind's thread.
+    #[test]
+    fn a_bind_does_not_build_the_pipeline_on_its_own_thread() {
+        let standin = 0x7E57_B003usize;
+        let (tx, rx) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            tx.send(std::thread::current().id()).unwrap();
+            0x6161
+        }), 0);
+        let me = std::thread::current().id();
+        assert_eq!(resolve_wait_for(standin, None), 0x6161);
+        let builder = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the build ran");
+        assert_ne!(builder, me, "the bind's thread ran the driver compile");
+        let _ = released(standin);
+    }
+
     /// A bind waits for a pipeline still being built no longer than its budget and goes on with
     /// the stand-in; later binds do not wait for it again; once built it is the real one.
     #[test]
@@ -504,8 +568,10 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built. The driver compile does not run on the
+/// caller: a console title never sits in that compile, and this title's stall check ends the
+/// process when its main thread has been held there. A worker that has not started the build
+/// does not stand in front of it either; this bind's compile runs on its own thread.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
@@ -514,14 +580,17 @@ pub fn resolve_wait(pso: usize) -> usize {
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
     if let Some(budget) = budget {
         return resolve_within(&p, pso, budget);
     }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        p.want();
+        build_off_the_caller(&p, job);
+    } else {
+        p.want();
     }
-    p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
@@ -529,6 +598,23 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
+    }
+}
+
+/// The driver compile of a bind whose worker has not started, on its own thread. The caller waits.
+fn build_off_the_caller(p: &Arc<Pending>, job: Job) {
+    let slot = Arc::new(Mutex::new(Some(job)));
+    let pending = Arc::clone(p);
+    let taken = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new().name("xcl-pso-bind".into()).stack_size(64 << 20).spawn(move || {
+        if let Some(job) = taken.lock().unwrap().take() {
+            build(&pending, job, false);
+        }
+    });
+    if spawned.is_err() {
+        if let Some(job) = slot.lock().unwrap().take() {
+            build(p, job, false);
+        }
     }
 }
 
