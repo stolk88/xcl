@@ -75,6 +75,7 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     }
     let pending = p.clone();
     let _permit = crate::gpu::recomp::dxc::begin_pipeline_build(preload, &move || pending.demand.lock().unwrap().wanted);
+    let _flight = enter_build();
     complete(p, job());
     if preload {
         // (under the lock: `want` does not raise this thread after it)
@@ -139,6 +140,27 @@ fn complete(p: &Pending, real: usize) {
 }
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
+/// Workers inside `build` (driver compile included). A GPU wait is not released while this is
+/// above zero: the producer queue is often only late, inside that compile.
+static BUILDS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Pipeline builds running now, including the driver's compile.
+pub(super) fn pipeline_builds_in_flight() -> usize {
+    BUILDS_IN_FLIGHT.load(Ordering::Acquire)
+}
+
+struct BuildFlight;
+
+impl Drop for BuildFlight {
+    fn drop(&mut self) {
+        BUILDS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn enter_build() -> BuildFlight {
+    BUILDS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    BuildFlight
+}
 
 pub fn enabled() -> bool {
     std::env::var("XCL_ASYNC_PSO").map_or(true, |v| v != "0")
