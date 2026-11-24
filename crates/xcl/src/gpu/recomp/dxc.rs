@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::core::{Interface, GUID, HRESULT, PCWSTR};
@@ -377,9 +377,18 @@ struct Job {
 /// Whether one of the title's threads waits for a compile (asked again while it is held back).
 pub type Wanted = Box<dyn Fn() -> bool + Send>;
 
-/// Compiles the title waits for that go on at once however little commit is left (each takes
-/// 0.1 – 0.7 GB).
+/// Compiles the title waits for that go on at once while commit stays above `COMMIT_FLOOR`
+/// (each takes 0.1 – 0.7 GB).
 const WANTED_AT_ONCE: usize = 6;
+
+/// Free commit under which a background compile waits and a compile the title is waiting for
+/// runs only when no other compile is running. Above it, the 60 s escape still applies: a title
+/// that sits inside the 6 GB reserve would otherwise finish its cold shaders a few a minute.
+/// Under it, another compile is what left a retail run ~300 MB of commit, and the title's next
+/// allocation came back null.
+const COMMIT_FLOOR: u64 = 2 << 30;
+
+static FLOOR_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
 /// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
@@ -416,6 +425,49 @@ impl Drop for MemorySlot {
     }
 }
 
+/// Free commit (`ullAvailPageFile`). `u64::MAX` when the query fails, so work is not held back.
+fn avail_commit() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 { u64::MAX } else { m.ullAvailPageFile }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Admit {
+    /// Several compiles may start (the reserve is met, the minute is up, or the title is waiting
+    /// and fewer than `WANTED_AT_ONCE` are running).
+    NowMany,
+    /// Only while nothing else is running (`compare_exchange` on `WORKING`).
+    NowOne,
+    Wait,
+}
+
+/// `avail` is free commit, `need` the reserve plus 1 GB per compile already running.
+fn admit_compile(avail: u64, need: u64, working: usize, waited_secs: u64, wanted: bool) -> Admit {
+    if avail >= need {
+        return Admit::NowMany;
+    }
+    if avail < COMMIT_FLOOR {
+        return if wanted && working == 0 { Admit::NowOne } else { Admit::Wait };
+    }
+    if waited_secs >= 60 || (working < WANTED_AT_ONCE && wanted) {
+        return Admit::NowMany;
+    }
+    if working == 0 { Admit::NowOne } else { Admit::Wait }
+}
+
+fn note_commit_floor(avail: u64) {
+    if FLOOR_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::xlog_warn!(
+        "DXC: {} MB of commit free, under {} MB: background shader builds wait so the title can still allocate",
+        avail >> 20,
+        COMMIT_FLOOR >> 20
+    );
+}
+
 /// Before a compile: with 6 GB of commit left or more, plus 1 GB for every compile already
 /// running (each can still grow to ~0.7 GB), at once; with less, one compile at a
 /// time – it goes when no other is running (and after a minute in any case). Each compile used
@@ -423,22 +475,80 @@ impl Drop for MemorySlot {
 /// left, and its last cold-cache shaders came a few a minute. One that the title waits for
 /// (`wanted`) goes on at once too, up to `WANTED_AT_ONCE`: at a retail title's world loading five
 /// of its threads waited for cold compiles, four of which stood in this queue, until its watchdog
-/// ended it.
+/// ended it. Under `COMMIT_FLOOR` that escape stops: a background compile waits, and a wanted
+/// one runs only on its own.
 pub fn wait_for_memory(wanted: &Wanted) -> MemorySlot {
-    use std::sync::atomic::Ordering;
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let start = std::time::Instant::now();
     loop {
-        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
-        let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
-        if plenty || start.elapsed().as_secs() >= 60 || (WORKING.load(Ordering::Acquire) < WANTED_AT_ONCE && wanted()) {
-            WORKING.fetch_add(1, Ordering::AcqRel);
-            return MemorySlot;
+        let avail = avail_commit();
+        let working = WORKING.load(Ordering::Acquire);
+        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((working as u64) << 30);
+        match admit_compile(avail, need, working, start.elapsed().as_secs(), wanted()) {
+            Admit::NowMany => {
+                WORKING.fetch_add(1, Ordering::AcqRel);
+                return MemorySlot;
+            }
+            Admit::NowOne => {
+                if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return MemorySlot;
+                }
+            }
+            Admit::Wait => {
+                if avail < COMMIT_FLOOR {
+                    note_commit_floor(avail);
+                }
+            }
         }
-        if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            return MemorySlot;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Pipeline builds already inside their driver compile (`begin_pipeline_build`).
+static HEAVY: AtomicUsize = AtomicUsize::new(0);
+
+/// Held across one pipeline build that started while commit was under `COMMIT_FLOOR`.
+pub struct BuildPermit;
+
+impl Drop for BuildPermit {
+    fn drop(&mut self) {
+        HEAVY.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BuildAdmit {
+    /// Commit is at or above the floor: builds are not counted.
+    Go,
+    /// Under the floor, and this build may be the only one running.
+    OnlyOne,
+    Wait,
+}
+
+fn admit_build(avail: u64, preload: bool, wanted: bool, heavy: usize) -> BuildAdmit {
+    if avail >= COMMIT_FLOOR {
+        return BuildAdmit::Go;
+    }
+    if preload && !wanted {
+        return BuildAdmit::Wait;
+    }
+    if heavy == 0 { BuildAdmit::OnlyOne } else { BuildAdmit::Wait }
+}
+
+/// Before a pipeline build. A preload the title is not waiting for stays here while free
+/// commit is under `COMMIT_FLOOR`. Any build that does start then is the only one, so its
+/// driver compile (outside the DXC slot) does not stack on top of the last free commit.
+pub fn begin_pipeline_build(preload: bool, wanted: &dyn Fn() -> bool) -> Option<BuildPermit> {
+    loop {
+        let avail = avail_commit();
+        let heavy = HEAVY.load(Ordering::Acquire);
+        match admit_build(avail, preload, wanted(), heavy) {
+            BuildAdmit::Go => return None,
+            BuildAdmit::OnlyOne => {
+                if HEAVY.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return Some(BuildPermit);
+                }
+            }
+            BuildAdmit::Wait => note_commit_floor(avail),
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -1247,5 +1357,44 @@ mod cache_tests {
             release_tx.send(()).unwrap();
             second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    const GB: u64 = 1 << 30;
+
+    #[test]
+    fn plenty_of_commit_lets_a_compile_start() {
+        assert_eq!(admit_compile(8 * GB, 6 * GB, 4, 0, false), Admit::NowMany);
+    }
+
+    #[test]
+    fn above_the_floor_one_background_compile_goes_and_the_minute_still_opens_the_gate() {
+        assert_eq!(admit_compile(3 * GB, 6 * GB, 0, 0, false), Admit::NowOne);
+        assert_eq!(admit_compile(3 * GB, 6 * GB, 2, 0, false), Admit::Wait);
+        assert_eq!(admit_compile(3 * GB, 6 * GB, 2, 60, false), Admit::NowMany);
+        assert_eq!(admit_compile(3 * GB, 6 * GB, 5, 0, true), Admit::NowMany);
+        assert_eq!(admit_compile(3 * GB, 6 * GB, 6, 0, true), Admit::Wait);
+    }
+
+    #[test]
+    fn under_the_floor_a_background_compile_waits_and_a_wanted_one_runs_alone() {
+        let left = 300 << 20;
+        assert_eq!(admit_compile(left, 6 * GB, 0, 120, false), Admit::Wait);
+        assert_eq!(admit_compile(left, 6 * GB, 1, 0, true), Admit::Wait);
+        assert_eq!(admit_compile(left, 6 * GB, 0, 0, true), Admit::NowOne);
+    }
+
+    #[test]
+    fn a_preload_waits_under_the_floor_until_the_title_wants_it() {
+        let left = 300 << 20;
+        assert_eq!(admit_build(3 * GB, true, false, 0), BuildAdmit::Go);
+        assert_eq!(admit_build(left, true, false, 0), BuildAdmit::Wait);
+        assert_eq!(admit_build(left, true, true, 0), BuildAdmit::OnlyOne);
+        assert_eq!(admit_build(left, false, true, 1), BuildAdmit::Wait);
+        assert_eq!(admit_build(left, false, true, 0), BuildAdmit::OnlyOne);
     }
 }
