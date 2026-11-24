@@ -59,8 +59,31 @@ const MAX_FILL: u64 = 256 << 20;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Watchdog timeout for GPU `queue.Wait` so a genuinely hung GPU cycle never triggers a 30 s
 /// hang, while giving heavy initial 3D frames (>1 s of dispatches) plenty of room to finish
-/// cleanly without prematurely breaking synchronization.
+/// cleanly without prematurely breaking synchronization. A wait is not released while a
+/// pipeline is still being built: the producer is late inside the driver, and signalling
+/// early lets the waiter run on memory that has not been written (device removed 0x887a0006).
 const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// A GPU `queue.Wait` is released on the CPU only after `timeout` with no pipeline build
+/// in flight. A build still running means the producer has not written the value yet.
+fn gpu_wait_expired(elapsed: Duration, timeout: Duration, builds_in_flight: usize) -> bool {
+    builds_in_flight == 0 && elapsed >= timeout
+}
+
+#[cfg(test)]
+mod gpu_wait_tests {
+    use super::*;
+
+    #[test]
+    fn a_gpu_wait_is_not_released_while_a_pipeline_is_still_being_built() {
+        let timeout = Duration::from_millis(5000);
+        assert!(!gpu_wait_expired(Duration::from_millis(4999), timeout, 0));
+        assert!(gpu_wait_expired(timeout, timeout, 0));
+        assert!(!gpu_wait_expired(Duration::from_secs(120), timeout, 1));
+        assert!(gpu_wait_expired(Duration::from_secs(120), timeout, 0));
+    }
+}
+
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -1368,6 +1391,13 @@ fn wake_sync_watchdog() {
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            let builds = super::pso_async::pipeline_builds_in_flight();
+            if builds > 0 && ARMED_GPU_WAITS.load(Ordering::Acquire) > 0 {
+                static HELD: AtomicU64 = AtomicU64::new(0);
+                if once(&HELD, 4) {
+                    crate::xlog_info!("D3D12.X: GPU queue.Wait release held while {builds} pipeline build(s) are still running");
+                }
+            }
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1396,7 +1426,7 @@ fn wake_sync_watchdog() {
                         let mut waiter_ty = -1i32;
                         let before = cell.armed_waits.len();
                         cell.armed_waits.retain(|aw| {
-                            if aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT {
+                            if gpu_wait_expired(aw.armed_at.elapsed(), GPU_WAIT_WATCHDOG_TIMEOUT, builds) {
                                 if aw.val >= max_exp {
                                     max_exp = aw.val;
                                     waiter_q = aw.waiting_queue;
