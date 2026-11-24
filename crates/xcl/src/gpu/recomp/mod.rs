@@ -25,6 +25,10 @@
 //!   N-th non-system ISG1 element, interpolated by the PC rasteriser in the mode given by the
 //!   I/J pair it uses; `exp mrtN` / `mrtz` = SV_Target / SV_Depth; lanes without a DONE export
 //!   are discarded.
+//! * AS (amplification / task) + MS: the task program runs as compute and fills dispatch
+//!   records in `res`; a pass-through `as_6_6` calls `DispatchMesh` with the payload; the NGG
+//!   program and pass-through mesh shader follow the MS path below (`amp_passthrough`,
+//!   `console_as_mesh`). Wave64 split matches mesh mode on 32-lane GPUs (NVIDIA).
 //! * MS (NGG, 9 282 programs in the retail pack): a compute shader (`[WaveSize(64)]`, the
 //!   thread group of PSV0) runs the program; `s_sendmsg 9` (GS_ALLOC_REQ, M0 = primitives << 12
 //!   | vertices), `exp pos/param` (vertex = thread index in the group) and `exp prim` (packed
@@ -57,7 +61,7 @@ pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;
 pub mod pso;
-pub use emit::mesh_passthrough;
+pub use emit::{amp_passthrough, mesh_passthrough};
 pub mod runner;
 #[cfg(test)]
 mod tests;
@@ -162,6 +166,25 @@ impl MsInterface {
     }
 }
 
+/// Amplification (task) shader interface: one record per task thread group in `res`
+/// before the pass-through AS calls `DispatchMesh`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsInterface {
+    /// threads per group (PSV0 numthreads.x)
+    pub threads: u32,
+    /// mesh-shader payload dwords (after the mesh-group count header dword)
+    pub payload_dwords: u32,
+}
+
+/// dwords before the payload in an amplification record: mesh groups to spawn (0 skips)
+pub const AS_HEADER: usize = 1;
+
+impl AsInterface {
+    pub fn record_dwords(&self) -> usize {
+        AS_HEADER + self.payload_dwords as usize
+    }
+}
+
 /// Legacy geometry shader emulated in compute (see the module docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GsInterface {
@@ -259,6 +282,7 @@ pub enum Mode {
     Vertex(VsInterface),
     Pixel(PsInterface),
     Mesh(MsInterface),
+    Amplification(AsInterface),
     Geometry(GsInterface),
 }
 
@@ -474,6 +498,11 @@ pub fn interface(blob: &[u8], sh: &super::xbox::XboxShader, f: &super::xbox::Fss
                 max_vertices: (p.ms_max_vertices as u32).clamp(1, 256),
                 max_primitives: (p.ms_max_primitives as u32).clamp(1, 256),
             }))
+        }
+        ("AS", 6) | ("AS", 7) => {
+            let p = super::dxbc::psv(blob)?;
+            let threads = p.numthreads.map(|t| t[0] * t[1].max(1) * t[2].max(1)).filter(|&t| t > 0).unwrap_or(128);
+            Some(Mode::Amplification(AsInterface { threads, payload_dwords: 4 }))
         }
         _ => None,
     }
@@ -1289,6 +1318,11 @@ pub fn translate_mesh(code: &[u8], ms: MsInterface, wave64: bool, split_wave64: 
     translate(code, &Options { mode: Mode::Mesh(ms), wave64, split_wave64, mem_windows, ..Default::default() })
 }
 
+/// Translate an amplification (task) shader; same wave64 / memory-window rules as mesh mode.
+pub fn translate_amplification(code: &[u8], as_: AsInterface, wave64: bool, split_wave64: bool, mem_windows: u32) -> Result<Translation, String> {
+    translate(code, &Options { mode: Mode::Amplification(as_), wave64, split_wave64, mem_windows, ..Default::default() })
+}
+
 /// Wave size the program was compiled for: 64-bit EXEC/VCC writes mean wave64.
 pub fn detect_wave64(code: &[u8]) -> bool {
     let mut off = 0;
@@ -1421,7 +1455,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     em.static_ss = constant_samplers(&insts, &leaders);
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
-    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Amplification(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
         em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
     }
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the

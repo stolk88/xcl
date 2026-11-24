@@ -685,7 +685,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
 /// shader writes one record per thread group (vertices + primitives, `record`) into `res`,
 /// then a pass-through mesh shader rasterises the records with the pixel shader.
 pub struct TwoPass {
-    /// compute pass (cs_6_6 DXIL)
+    /// compute pass (cs_6_6 DXIL) – the mesh (NGG) program, or sole compute when no AS
     pub cs: Vec<u8>,
     /// pass-through mesh shader (ms_6_6 DXIL)
     pub ms: Vec<u8>,
@@ -695,6 +695,11 @@ pub struct TwoPass {
     pub mesh_groups_per_record: u32,
     /// static samplers of the compute pass
     pub samplers: Vec<StaticSampler>,
+    /// amplification task program as compute (optional)
+    pub as_cs: Option<Vec<u8>>,
+    /// pass-through amplification shader (as_6_6 DXIL)
+    pub as_dxil: Option<Vec<u8>>,
+    pub as_iface: Option<super::AsInterface>,
 }
 
 fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option<&[u8]>) -> Result<TwoPass, String> {
@@ -706,7 +711,27 @@ fn finish_two_pass(t: super::Translation, record: super::MsInterface, ps: Option
     let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
     let ms = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
     let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers })
+    Ok(TwoPass { cs, ms, record, mesh_groups_per_record, samplers: t.static_samplers, as_cs: None, as_dxil: None, as_iface: None })
+}
+
+fn finish_as_two_pass(
+    as_t: super::Translation,
+    as_iface: super::AsInterface,
+    ms: TwoPass,
+) -> Result<TwoPass, String> {
+    if !as_t.complete() {
+        let missing: Vec<&String> = as_t.unsupported.keys().collect();
+        return Err(format!("AS incomplete translation, missing: {missing:?}"));
+    }
+    let as_cs = dxc::compile_cached(&as_t.hlsl, "main", "cs_6_6")?.0;
+    let as_dxil = dxc::compile_cached(&super::emit::amp_passthrough(&as_iface), "main", "as_6_6")?.0;
+    let mut samplers = ms.samplers.clone();
+    for s in as_t.static_samplers {
+        if !samplers.contains(&s) {
+            samplers.push(s);
+        }
+    }
+    Ok(TwoPass { as_cs: Some(as_cs), as_dxil: Some(as_dxil), as_iface: Some(as_iface), samplers, ..ms })
 }
 
 /// The mesh-shader (NGG) program of a console MS container; the pass-through carries what
@@ -729,12 +754,43 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
                 let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return Ok(TwoPass {
+                    cs: k.dxil,
+                    ms: msb,
+                    record,
+                    mesh_groups_per_record,
+                    samplers: k.static_samplers,
+                    as_cs: None,
+                    as_dxil: None,
+                    as_iface: None,
+                });
             }
             Err(e) => direct_fallback("MS", &e),
         }
     }
     finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
+}
+
+fn console_as_blob(blob: &[u8], split_wave64: bool) -> Result<(super::Translation, super::AsInterface), String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh
+        .fssm
+        .iter()
+        .find(|f| f.stages.first().is_some_and(|s| s.hw == 6 || s.hw == 7))
+        .ok_or("no AS hardware variant")?;
+    let mode = super::interface(blob, &sh, f).ok_or("unknown AS interface")?;
+    let super::Mode::Amplification(as_iface) = mode else { return Err("the container is not an AS".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let wave64 = super::detect_wave64(code);
+    Ok((super::translate_amplification(code, as_iface.clone(), wave64, split_wave64, mem_windows())?, as_iface))
+}
+
+/// Amplification + mesh (NGG) pipeline; AS and MS each get compute + pass-through stages.
+pub fn console_as_mesh(as_blob: &[u8], ms_blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    let ms = console_mesh(ms_blob, ps, split_wave64)?;
+    let (as_t, as_iface) = console_as_blob(as_blob, split_wave64)?;
+    finish_as_two_pass(as_t, as_iface, ms)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
