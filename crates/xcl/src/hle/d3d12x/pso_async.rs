@@ -347,6 +347,12 @@ mod used {
     }
 }
 
+/// The pipeline keys an earlier run wrote (`used-pipelines.txt` beside the DXIL cache).
+pub fn earlier_used_keys() -> std::collections::HashSet<u64> {
+    let path = crate::gpu::recomp::dxc::cache_dir().join("used-pipelines.txt");
+    used::parse(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
 /// The workers that build the pipelines of an earlier run ahead of their first use
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
@@ -409,6 +415,18 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+
+    /// `used-pipelines.txt` is one hex key per line. The key is the console shader bytes.
+    #[test]
+    fn a_used_pipeline_line_is_that_shaders_key() {
+        let blob = b"console-cs".to_vec();
+        let key = crate::hle::d3d12x::real::shaders_key(&[blob]);
+        let parsed = used::parse(&format!("{key:016x}\nzzzz\n0000000000000000\n"));
+        assert!(parsed.contains(&key));
+        assert_eq!(parsed.len(), 1);
+        let other = crate::hle::d3d12x::real::shaders_key(&[b"other".to_vec()]);
+        assert!(!parsed.contains(&other));
+    }
 
     /// While a bind waits for a pipeline still being built, the title is held.
     #[test]
