@@ -716,10 +716,22 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
+        let used_only = args.iter().any(|a| a == "--used-only");
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
         let windows = opt("--windows").unwrap_or(4) as u32;
         let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        let used = if used_only {
+            let keys = crate::hle::d3d12x::pso_async::earlier_used_keys();
+            if keys.is_empty() {
+                eprintln!("xcl shaders --used-only: no pipelines in used-pipelines.txt yet – run the title once first");
+                return 2;
+            }
+            eprintln!("--used-only: {} pipeline keys from an earlier run", keys.len());
+            Some(keys)
+        } else {
+            None
+        };
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used.as_ref(), t0);
     }
     if args.iter().any(|a| a == "--direct") {
         return direct_sweep(&input, args, top, json, t0);
@@ -743,6 +755,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
 /// cache the runtime reads at startup. Nothing runs on the GPU.
+/// `--used-only`: with `--pipelines`, only the compute programs whose pipeline an earlier run
+/// wrote to `used-pipelines.txt`. The game is not running, so the driver's compile does not
+/// share the title's memory.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
@@ -841,7 +856,12 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+/// A compute program whose pipeline key an earlier run wrote. Other stages are left out.
+fn used_only_keeps(compute: bool, key: u64, used: &std::collections::HashSet<u64>) -> bool {
+    compute && key != 0 && used.contains(&key)
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, used: Option<&std::collections::HashSet<u64>>, t0: std::time::Instant) -> i32 {
     let pipelines = if pipelines {
         match Pipelines::new() {
             Ok(p) => Some(p),
@@ -856,7 +876,7 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
-    let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (done, compiled, cached, failed, skipped, passed) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
@@ -888,9 +908,18 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                     done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                let compute = sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_))));
+                if let Some(used) = used {
+                    let key = crate::hle::d3d12x::real::shaders_key(&[blob.to_vec()]);
+                    if !used_only_keeps(compute, key, used) {
+                        passed.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
-                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                if compute {
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
@@ -957,11 +986,12 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         }
     });
     println!(
-        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, time {:.1} s",
+        "compiled {}, already cached {}, errors {}, skipped (GS – paired at pipeline creation) {}, passed over {}, time {:.1} s",
         compiled.into_inner(),
         cached.into_inner(),
         failed.into_inner(),
         skipped.into_inner(),
+        passed.into_inner(),
         t0.elapsed().as_secs_f64()
     );
     if let Some(p) = pipelines {
@@ -1264,6 +1294,21 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
 mod tests {
     use super::*;
     use crate::gpu::xbox::tests::{fssm, sample, CODE};
+
+    /// `--used-only` builds the compute program an earlier run wrote and leaves the rest.
+    #[test]
+    fn used_only_keeps_a_compute_program_an_earlier_run_wrote() {
+        let blob = b"console-cs".to_vec();
+        let key = crate::hle::d3d12x::real::shaders_key(&[blob]);
+        let other = crate::hle::d3d12x::real::shaders_key(&[b"other".to_vec()]);
+        let mut used = std::collections::HashSet::new();
+        used.insert(key);
+        assert_ne!(key, other);
+        assert!(used_only_keeps(true, key, &used));
+        assert!(!used_only_keeps(false, key, &used), "a vertex shader is not a compute pipeline");
+        assert!(!used_only_keeps(true, other, &used));
+        assert!(!used_only_keeps(true, 0, &used));
+    }
 
     #[test]
     fn aggregates_console_shaders() {

@@ -814,10 +814,21 @@ fn content_hash(b: &[u8]) -> u64 {
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
 }
 
-/// staging bytes of one batch at most
-const BATCH_BYTES: usize = 256 << 20;
+/// staging bytes of one batch at most. A 256 MiB batch stayed mapped for the rest of the
+/// process and, with thousands of small streamed textures under that cap, one
+/// `ExecuteCommandLists` could run long enough for a WDDM timeout.
+const BATCH_BYTES: usize = 32 << 20;
+/// textures in one batch at most (the byte cap alone lets thousands of small ones through)
+const BATCH_ITEMS: usize = 256;
 
-/// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
+/// Another upload fits this batch. The first one always does, even when it is larger than
+/// `BATCH_BYTES`, so a single big texture still goes up.
+fn batch_fits(n: usize, bytes: usize, add: usize, dev: usize, device: usize) -> bool {
+    n == 0 || (dev == device && n < BATCH_ITEMS && bytes.saturating_add(add) <= BATCH_BYTES)
+}
+
+/// The uploads `todo`, in batches of up to `BATCH_ITEMS` textures and `BATCH_BYTES` (one list
+/// and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
@@ -831,7 +842,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
-            if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
+            if !batch_fits(picked.len(), bytes, tex.size() as usize, *dev, device) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -852,6 +863,9 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             device = dev;
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
+        }
+        if picked.is_empty() {
+            continue;
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
@@ -1217,6 +1231,20 @@ mod tests {
         assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
+    }
+
+    /// A batch takes its first texture however large, then stops at 256 textures, 32 MiB or a
+    /// different device.
+    #[test]
+    fn batch_fits_caps_items_bytes_and_device() {
+        assert!(batch_fits(0, 0, BATCH_BYTES + 1, 1, 0), "the first texture always starts a batch");
+        assert!(batch_fits(1, 0, 1, 1, 1));
+        assert!(!batch_fits(1, 0, 1, 2, 1), "a different device starts the next batch");
+        assert!(batch_fits(BATCH_ITEMS - 1, 0, 1, 1, 1));
+        assert!(!batch_fits(BATCH_ITEMS, 0, 1, 1, 1), "256 textures is a full batch");
+        assert!(batch_fits(1, BATCH_BYTES - 10, 10, 1, 1));
+        assert!(!batch_fits(1, BATCH_BYTES - 10, 11, 1, 1));
+        assert!(!batch_fits(1, usize::MAX - 4, 8, 1, 1), "the byte sum does not wrap");
     }
 
     /// Real uploads, dirty-page detection and a source changing after registration:
